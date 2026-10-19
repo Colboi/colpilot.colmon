@@ -6,6 +6,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from .taskbar import (
@@ -128,6 +129,12 @@ class TaskbarWindowController:
             errors='replace',
             bufsize=1,
             creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+            env={
+                **os.environ,
+                'DOTNET_BUNDLE_EXTRACT_BASE_DIR': str(
+                    (self.artifact_directory / 'native-runtime').resolve()
+                ),
+            },
         )
         self.process_registry.register('colmon:window-host', process)
         with self.state_lock:
@@ -468,6 +475,58 @@ class TaskbarWindowController:
             for path in dll_names:
                 if path.is_file():
                     return [dotnet, str(path)]
-        raise FileNotFoundError(
-            '没有找到 colmon 原生窗口宿主，请先构建 plugins/colmon/native/ColpilotColmonWindows.csproj'
-        )
+        return [str(self._build_helper(native_root, dotnet))]
+
+    def _build_helper(self, native_root: Path, dotnet: str | None) -> Path:
+        project_path = native_root / 'ColpilotColmonWindows.csproj'
+        if not project_path.is_file():
+            raise FileNotFoundError(f'colmon 原生窗口宿主项目不存在：{project_path}')
+        if dotnet is None:
+            raise FileNotFoundError('首次启动 colmon 需要安装 .NET 10 SDK，然后重新启用插件')
+
+        self.artifact_directory.mkdir(parents=True, exist_ok=True)
+        log_path = self.artifact_directory / 'native-build.log'
+        intermediate_root = native_root / 'obj'
+        intermediate_root.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix='colmon-publish-', dir=intermediate_root) as output_directory:
+            command = [
+                dotnet,
+                'publish',
+                str(project_path.resolve()),
+                '--configuration', 'Release',
+                '--runtime', 'win-x64',
+                '--self-contained', 'true',
+                '--disable-build-servers',
+                '--nologo',
+                '-p:PublishSingleFile=true',
+                '-p:IncludeNativeLibrariesForSelfExtract=true',
+                '--output', str(Path(output_directory).resolve()),
+            ]
+            with log_path.open('w', encoding='utf-8') as log_file:
+                process = subprocess.Popen(
+                    command,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    creationflags=CREATE_NO_WINDOW,
+                    env={**os.environ, 'DOTNET_CLI_UI_LANGUAGE': 'en'},
+                )
+                self.process_registry.register('colmon:native-build', process)
+                try:
+                    exit_code = process.wait(timeout=300)
+                finally:
+                    if process.poll() is None:
+                        self.process_registry.stop_process(process, timeout_seconds=1.0)
+                    self.process_registry.unregister(process)
+            if exit_code != 0:
+                raise RuntimeError(
+                    f'colmon 原生窗口宿主自动编译失败，退出代码：{exit_code}。'
+                    f'请确认已安装 .NET 10 SDK；编译日志：{log_path}'
+                )
+            executable = Path(output_directory) / 'ColpilotColmonWindows.exe'
+            if not executable.is_file():
+                raise FileNotFoundError(f'colmon 编译结果缺少窗口宿主程序：{executable}')
+            publish_root = native_root / 'publish'
+            publish_root.mkdir(parents=True, exist_ok=True)
+            destination = publish_root / executable.name
+            executable.replace(destination)
+            return destination
