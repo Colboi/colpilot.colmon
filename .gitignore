@@ -1,8 +1,0 @@
-__pycache__/
-*.py[cod]
-settings.json
-config.ini
-data/
-native/bin/
-native/obj/
-native/publish/
