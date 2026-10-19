@@ -1,0 +1,12 @@
+{
+  "id": "colmon",
+  "name": "持续监控",
+  "description": "管理 Codex weekly、5h limit 和 Tokens today 三个任务栏窗口。",
+  "icon": null,
+  "category": "持续监控",
+  "color": "#8b5cf6",
+  "tool_type": "continuous",
+  "view": "colmon",
+  "frontend": "ui/ColmonView.vue",
+  "backend": "plugins.colmon.backend:create_plugin"
+}
