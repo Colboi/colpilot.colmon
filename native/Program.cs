@@ -1,7 +1,9 @@
 using System.ComponentModel;
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using Serilog;
 
 namespace ColpilotColmonWindows;
 
@@ -10,17 +12,36 @@ internal static class Program
     [STAThread]
     private static int Main()
     {
-        ApplicationConfiguration.Initialize();
-        var reporter = new HostReporter();
-        using var context = new TaskbarApplicationContext(reporter);
-        var commandThread = new Thread(() => ReadCommands(context))
+        NativeDiagnostics.Initialize();
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
+        try
         {
-            IsBackground = true,
-            Name = "colmon-native-command-reader"
-        };
-        commandThread.Start();
-        Application.Run(context);
-        return 0;
+            ApplicationConfiguration.Initialize();
+            using var watchdog = new System.Threading.Timer(NativeDiagnostics.Check, null, 5000, 5000);
+            using var heartbeat = new System.Windows.Forms.Timer { Interval = 1000 };
+            heartbeat.Tick += (_, _) => NativeDiagnostics.UiTick();
+            heartbeat.Start();
+            using var reporter = new HostReporter();
+            using var context = new TaskbarApplicationContext(reporter);
+            var commandThread = new Thread(() => ReadCommands(context))
+            {
+                IsBackground = true,
+                Name = "colmon-native-command-reader"
+            };
+            commandThread.Start();
+            Application.Run(context);
+            return 0;
+        }
+        catch (Exception exception)
+        {
+            Log.Fatal(exception, "窗口宿主终止");
+            throw;
+        }
+        finally
+        {
+            Log.Information("窗口宿主退出");
+            Log.CloseAndFlush();
+        }
     }
 
     private static void ReadCommands(TaskbarApplicationContext context)
@@ -33,6 +54,7 @@ internal static class Program
                 var line = input.ReadLine();
                 if (line is null)
                 {
+                    Log.Information("宿主命令输入结束");
                     context.RequestShutdown();
                     return;
                 }
@@ -40,6 +62,7 @@ internal static class Program
                 using var document = JsonDocument.Parse(line);
                 var root = document.RootElement;
                 var type = root.GetProperty("type").GetString();
+                Log.Information("收到宿主命令 type={Type}", type);
                 switch (type)
                 {
                     case "state":
@@ -60,18 +83,61 @@ internal static class Program
     }
 }
 
-internal sealed class HostReporter
+internal sealed class HostReporter : IDisposable
 {
-    private readonly object _lock = new();
+    private readonly BlockingCollection<string> _messages = new(256);
+    private readonly Thread _writer;
     private static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web);
+
+    public HostReporter()
+    {
+        _writer = new Thread(WriteMessages)
+        {
+            IsBackground = true,
+            Name = "colmon-native-output-writer"
+        };
+        _writer.Start();
+    }
 
     public void Write(object message)
     {
-        lock (_lock)
+        if (!_messages.TryAdd(JsonSerializer.Serialize(message, Options)))
         {
-            Console.WriteLine(JsonSerializer.Serialize(message, Options));
-            Console.Out.Flush();
+            throw new InvalidOperationException("宿主输出队列已满");
         }
+    }
+
+    private void WriteMessages()
+    {
+        try
+        {
+            foreach (var message in _messages.GetConsumingEnumerable())
+            {
+                using var operation = NativeDiagnostics.Begin("HostReporter.Write");
+                operation.Stage = "Console.WriteLine";
+                Console.WriteLine(message);
+                operation.Stage = "Console.Out.Flush";
+                Console.Out.Flush();
+            }
+        }
+        catch (Exception exception)
+        {
+            Log.Fatal(exception, "宿主输出通信失败");
+            Log.CloseAndFlush();
+            Environment.Exit(1);
+        }
+    }
+
+    public void Dispose()
+    {
+        _messages.CompleteAdding();
+        if (!_writer.Join(TimeSpan.FromSeconds(2)))
+        {
+            Log.Error("宿主输出通信超时");
+            Log.CloseAndFlush();
+            Environment.Exit(1);
+        }
+        _messages.Dispose();
     }
 }
 
@@ -94,7 +160,11 @@ internal sealed class TaskbarApplicationContext : ApplicationContext
         ];
         foreach (var form in _forms)
         {
-            form.FormClosed += (_, _) => RequestShutdown();
+            form.FormClosed += (_, arguments) =>
+            {
+                Log.Information("任务栏窗口关闭 window={Window} reason={Reason}", form.WindowId, arguments.CloseReason);
+                RequestShutdown();
+            };
             form.Show();
         }
 
@@ -126,6 +196,7 @@ internal sealed class TaskbarApplicationContext : ApplicationContext
 
     public void ReportFailure(Exception exception)
     {
+        Log.Error(exception, "窗口宿主命令处理失败");
         _reporter.Write(new
         {
             type = "error",
@@ -169,6 +240,7 @@ internal sealed class TaskbarApplicationContext : ApplicationContext
 
     private void CloseApplication()
     {
+        Log.Information("开始关闭任务栏窗口");
         _readyTimer.Stop();
         foreach (var form in _forms)
         {
@@ -271,22 +343,29 @@ internal sealed class TaskbarMetricForm : Form
 
     private void AttachAndPlace(string reason)
     {
+        using var operation = NativeDiagnostics.Begin($"AttachAndPlace:{WindowId}:{reason}");
         if (!IsHandleCreated)
         {
             return;
         }
 
+        operation.Stage = $"FindWindow:{WindowId}";
         var taskbar = NativeMethods.FindWindow("Shell_TrayWnd", null);
         if (taskbar == 0)
         {
+            if (_attached) Log.Error("任务栏窗口不可用 window={Window} previousTaskbar={Taskbar:X}", WindowId, _taskbar);
             _attached = false;
             return;
         }
 
         if (!_attached || taskbar != _taskbar || NativeMethods.GetAncestor(Handle, NativeMethods.GaParent) != taskbar)
         {
+            NativeMethods.GetWindowThreadProcessId(taskbar, out var explorerProcessId);
+            Log.Information("附着任务栏 window={Window} handle={Handle:X} oldTaskbar={OldTaskbar:X} taskbar={Taskbar:X} explorerPid={ExplorerPid} reason={Reason}",
+                WindowId, Handle, _taskbar, taskbar, explorerProcessId, reason);
             _taskbar = taskbar;
             _notifyArea = NativeMethods.FindWindowEx(taskbar, 0, "TrayNotifyWnd", null);
+            operation.Stage = $"SetParent:{WindowId}";
             NativeMethods.SetParent(Handle, taskbar);
             _attached = NativeMethods.GetAncestor(Handle, NativeMethods.GaParent) == taskbar;
         }
@@ -296,6 +375,7 @@ internal sealed class TaskbarMetricForm : Form
             return;
         }
 
+        operation.Stage = $"ReadTaskbarRect:{WindowId}";
         var taskbarRect = NativeMethods.Rect(_taskbar);
         var notifyRect = _notifyArea == 0 ? default : NativeMethods.Rect(_notifyArea);
         var dpi = Math.Max(96u, NativeMethods.GetDpiForWindow(_taskbar));
@@ -308,6 +388,7 @@ internal sealed class TaskbarMetricForm : Form
             ? taskbarRect.Right - (int)Math.Round(110 * scale)
             : notifyRect.Left;
         var gap = Math.Max(2, (int)Math.Round(WindowGap * scale));
+        operation.Stage = $"ExternalWindows:{WindowId}";
         var occupied = TaskbarPlacement.ExternalWindows(_taskbar, Handle, taskbarRect);
         var anchorX = TaskbarPlacement.FindAvailableX(
             taskbarRect.Left,
@@ -318,6 +399,7 @@ internal sealed class TaskbarMetricForm : Form
             occupied.Select(window => window.Rectangle));
         var x = Math.Clamp(anchorX - _slotIndex * (width + gap), 0, Math.Max(0, taskbarRect.Width - width));
         var y = Math.Clamp((taskbarRect.Height - height) / 2, 0, Math.Max(0, taskbarRect.Height - height));
+        operation.Stage = $"MoveWindow:{WindowId}";
         if (!NativeMethods.MoveWindow(Handle, x, y, width, height, true))
         {
             throw new Win32Exception(Marshal.GetLastWin32Error(), $"无法调整任务栏窗口位置：{WindowId}");
@@ -328,6 +410,7 @@ internal sealed class TaskbarMetricForm : Form
             return;
         }
 
+        operation.Stage = $"ReportPlacement:{WindowId}";
         _reporter.Write(new
         {
             type = "window",
@@ -356,10 +439,15 @@ internal sealed class TaskbarMetricForm : Form
 
     protected override void WndProc(ref Message message)
     {
+        if (message.Msg is 0x0002 or 0x0082)
+        {
+            Log.Information("窗口销毁消息 window={Window} message={Message:X} taskbar={Taskbar:X}", WindowId, message.Msg, _taskbar);
+        }
         base.WndProc(ref message);
         var messageCode = message.Msg;
         if ((uint)messageCode == _taskbarCreatedMessage || messageCode is WmDisplayChange or WmSettingChange or WmDpiChanged)
         {
+            Log.Information("任务栏相关消息 window={Window} message={Message:X}", WindowId, messageCode);
             BeginInvoke(() => AttachAndPlace($"window-message-{messageCode:X}"));
         }
     }

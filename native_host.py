@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -21,6 +22,7 @@ from .taskbar import (
 
 CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 CREATE_NEW_PROCESS_GROUP = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+logger = logging.getLogger(__name__)
 
 
 class ManagedTaskbarWindow:
@@ -61,6 +63,7 @@ class ManagedTaskbarWindow:
         self.controller.send_window_state(self)
 
     def set_error(self, detail: str) -> None:
+        logger.error('窗口数据错误 window=%s detail=%s', self.definition['id'], detail)
         with self.lock:
             self.status = 'error'
             self.detail = detail
@@ -93,6 +96,8 @@ class TaskbarWindowController:
         self.helper_stdout_thread: threading.Thread | None = None
         self.helper_stderr_thread: threading.Thread | None = None
         self.poll_thread: threading.Thread | None = None
+        self.monitor_thread: threading.Thread | None = None
+        self.last_host_message = time.monotonic()
         self.windows: dict[str, ManagedTaskbarWindow] = {}
         self.last_error: str | None = None
 
@@ -119,6 +124,7 @@ class TaskbarWindowController:
             self.last_error = None
 
         command = self._helper_command()
+        logger.info('启动窗口宿主 executable=%s refresh_interval=%s', command[0], self.refresh_interval_seconds)
         process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -131,6 +137,7 @@ class TaskbarWindowController:
             creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
             env={
                 **os.environ,
+                'COLMON_LOG_DIRECTORY': str((self.plugin_root / 'data' / 'logs').resolve()),
                 'DOTNET_BUNDLE_EXTRACT_BASE_DIR': str(
                     (self.artifact_directory / 'native-runtime').resolve()
                 ),
@@ -174,8 +181,12 @@ class TaskbarWindowController:
             name='colmon-taskbar-poll',
         )
         self.poll_thread.start()
+        self.monitor_thread = threading.Thread(target=self._monitor_host, name='colmon-host-monitor')
+        self.monitor_thread.start()
+        logger.info('窗口宿主已就绪 pid=%s', process.pid)
 
     def stop(self) -> None:
+        logger.info('开始关闭窗口宿主 pid=%s', self.helper_pid)
         self.stop_event.set()
         self.process_registry.stop_owner('colmon:codex-app-server', timeout_seconds=2.0)
         with self.state_lock:
@@ -197,7 +208,7 @@ class TaskbarWindowController:
 
         current_thread = threading.current_thread()
         join_deadline = time.monotonic() + 2.0
-        for thread in (poll_thread, stdout_thread, stderr_thread):
+        for thread in (poll_thread, stdout_thread, stderr_thread, self.monitor_thread):
             if thread is not None and thread is not current_thread:
                 thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
 
@@ -213,6 +224,7 @@ class TaskbarWindowController:
                 window.attached = False
                 window.visible = False
             self.write_window_state(window)
+        logger.info('窗口宿主关闭完成 exit_code=%s', process.poll() if process else None)
 
     def is_running(self) -> bool:
         with self.state_lock:
@@ -241,6 +253,13 @@ class TaskbarWindowController:
                 'exit_code': process.returncode,
             }
         if process is not None and process.poll() is None and helper_ready:
+            message_age = time.monotonic() - self.last_host_message
+            if message_age > 15:
+                return {
+                    'status': 'error',
+                    'detail': f'窗口宿主超过 {int(message_age)} 秒没有发送状态',
+                    'exit_code': None,
+                }
             invalid_windows = [
                 window.definition['id']
                 for window in self.windows.values()
@@ -285,12 +304,25 @@ class TaskbarWindowController:
                     'rectangles': dict(window.rectangles),
                 }
             self.artifact_directory.mkdir(parents=True, exist_ok=True)
-            temporary_path = window.state_path.with_suffix(window.state_path.suffix + '.tmp')
-            temporary_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
-                encoding='utf-8',
-            )
-            temporary_path.replace(window.state_path)
+            serialized = json.dumps(payload, ensure_ascii=False, indent=2) + '\n'
+            try:
+                # 状态接口使用同一把锁，读取始终发生在完整写入之后。
+                window.state_path.write_text(serialized, encoding='utf-8')
+            except OSError as error:
+                logger.exception('保存窗口状态失败 path=%s', window.state_path)
+                self._fail_host(f'保存窗口状态失败：{error}')
+                raise
+
+    def _fail_host(self, detail: str) -> None:
+        with self.state_lock:
+            if self.stop_event.is_set():
+                return
+            self.last_error = detail
+            self.stop_event.set()
+            self.ready_event.set()
+            process = self.helper_process
+        if process is not None:
+            self.process_registry.stop_process(process, timeout_seconds=1.0)
 
     def send_window_state(self, window: ManagedTaskbarWindow) -> None:
         with window.lock:
@@ -319,9 +351,13 @@ class TaskbarWindowController:
             if process is None or process.poll() is not None or process.stdin is None:
                 return
             try:
+                started = time.monotonic()
+                logger.info('发送宿主命令开始 type=%s window=%s', message['type'], message.get('state', {}).get('windowId'))
                 process.stdin.write(json.dumps(message, ensure_ascii=False) + '\n')
                 process.stdin.flush()
+                logger.info('发送宿主命令完成 type=%s elapsed_ms=%.1f', message['type'], (time.monotonic() - started) * 1000)
             except (BrokenPipeError, OSError) as error:
+                logger.exception('窗口宿主通信失败 pid=%s', process.pid)
                 if not self.stop_event.is_set():
                     with self.state_lock:
                         self.last_error = f'colmon 原生窗口宿主通信失败：{error}'
@@ -336,6 +372,7 @@ class TaskbarWindowController:
             return
         try:
             for line in iter(stream.readline, ''):
+                self.last_host_message = time.monotonic()
                 if not line.strip():
                     continue
                 message = json.loads(line)
@@ -343,26 +380,23 @@ class TaskbarWindowController:
                     raise RuntimeError('colmon 原生窗口宿主返回的数据格式无效')
                 self._handle_helper_message(message)
         except (OSError, json.JSONDecodeError, RuntimeError) as error:
-            if not self.stop_event.is_set():
-                with self.state_lock:
-                    self.last_error = f'colmon 原生窗口宿主返回数据失败：{error}'
-                    self.ready_event.set()
+            logger.exception('读取窗口宿主输出失败 pid=%s', process.pid)
+            self._fail_host(f'colmon 原生窗口宿主返回数据失败：{error}')
         finally:
-            if not self.stop_event.is_set() and process.poll() is not None:
-                with self.state_lock:
-                    if self.last_error is None:
-                        self.last_error = f'colmon 原生窗口宿主已退出，退出代码：{process.returncode}'
-                    self.ready_event.set()
+            logger.info('窗口宿主输出结束 pid=%s exit_code=%s stopping=%s', process.pid, process.poll(), self.stop_event.is_set())
+            if not self.stop_event.is_set():
+                self._fail_host(f'colmon 原生窗口宿主输出结束，退出代码：{process.poll()}')
 
     def _drain_helper_error(self, process: subprocess.Popen[str]) -> None:
         stream = process.stderr
         if stream is not None:
-            for _ in iter(stream.readline, ''):
-                pass
+            for line in iter(stream.readline, ''):
+                logger.error('窗口宿主 stderr pid=%s %s', process.pid, line.rstrip())
 
     def _handle_helper_message(self, message: dict[str, object]) -> None:
         message_type = message.get('type')
         if message_type == 'ready':
+            logger.info('收到窗口宿主就绪消息 pid=%s', message.get('processId'))
             with self.state_lock:
                 self.helper_ready = True
                 self.ready_event.set()
@@ -371,6 +405,7 @@ class TaskbarWindowController:
             self._update_window_metadata(message)
             return
         if message_type == 'error':
+            logger.error('窗口宿主报告错误 %s', message.get('detail'))
             detail = str(message.get('detail') or 'colmon 原生窗口宿主报告了错误')
             with self.state_lock:
                 self.last_error = detail
@@ -384,6 +419,7 @@ class TaskbarWindowController:
         if window is None:
             raise RuntimeError(f'colmon 原生窗口宿主返回了未知窗口：{window_id}')
         with window.lock:
+            previous = (window.attached, window.visible, dict(window.handles))
             window.attached = message.get('attached') is True
             window.visible = message.get('visible') is True
             dpi = message.get('dpi')
@@ -398,9 +434,29 @@ class TaskbarWindowController:
             rectangles = message.get('rectangles')
             if isinstance(rectangles, dict):
                 window.rectangles = dict(rectangles)
+            if previous != (window.attached, window.visible, window.handles):
+                logger.info('任务栏窗口变化 window=%s metadata=%s', window_id, json.dumps(message, ensure_ascii=False))
         self.write_window_state(window)
         if all(item.attached and item.visible for item in self.windows.values()):
             self.windows_ready_event.set()
+
+    def _monitor_host(self) -> None:
+        previous_status = None
+        next_heartbeat = 0.0
+        while not self.stop_event.wait(5):
+            status = self.runtime_status()
+            now = time.monotonic()
+            if status != previous_status or now >= next_heartbeat:
+                logger.log(
+                    logging.ERROR if status['status'] == 'error' else logging.INFO,
+                    '窗口宿主定期检查 pid=%s status=%s message_age=%.1f poll_alive=%s windows=%s',
+                    self.helper_pid, status, now - self.last_host_message,
+                    self.poll_thread.is_alive() if self.poll_thread else False,
+                    {key: {'status': window.status, 'attached': window.attached, 'visible': window.visible}
+                     for key, window in self.windows.items()},
+                )
+                previous_status = status
+                next_heartbeat = now + 60
 
     def _run_poll(self) -> None:
         quota_reader = CodexQuotaReader(self.process_registry, self.stop_event)
@@ -411,10 +467,12 @@ class TaskbarWindowController:
             if wait_seconds > 0 and self.stop_event.wait(wait_seconds):
                 return
             started_at = time.monotonic()
+            logger.info('配额与用量查询开始')
             self._read_quota_windows(quota_reader)
             if self.stop_event.is_set():
                 return
             self._read_window('codex-tokens-today', token_reader.read)
+            logger.info('配额与用量查询完成 elapsed_ms=%.1f', (time.monotonic() - started_at) * 1000)
             next_poll = started_at + self.refresh_interval_seconds
 
     def _read_quota_windows(self, quota_reader: CodexQuotaReader) -> None:
@@ -448,6 +506,7 @@ class TaskbarWindowController:
             self._set_window_error(window_id, error)
 
     def _set_window_error(self, window_id: str, error: Exception) -> None:
+        logger.error('查询失败 window=%s', window_id, exc_info=(type(error), error, error.__traceback__))
         window = self.windows.get(window_id)
         if window is None or self.stop_event.is_set():
             return
